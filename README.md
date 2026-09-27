@@ -15,20 +15,24 @@ wp81BmsTool list
 |---|---|
 | `<ioctl>` | A numeric code (`0x80180FAC`) or a name (`GET_PERCENT_CHARGE`, `IOCTL_BMS_GET_PERCENT_CHARGE` or the alias `percent`). Names are case-insensitive. |
 | `input` | 32-bit input values, decimal or `0x` hex. Negative values are allowed. |
-| `-o n` | Output buffer size in bytes. The default depends on the IOCTL (4 if unknown). |
-| `-i n` | Input buffer size in bytes. The input is zero-padded or truncated to this size. |
+| `-o n` | Output buffer size in bytes. The default is the size the driver requires (4 if the IOCTL is unknown). |
+| `-i n` | Input buffer size in bytes. The default is the size the driver requires; missing input values are sent as 0. |
 | `-d path` | Device path. The default is `\\.\QCOMPMICBMS`. |
-| `list` | Prints the known IOCTLs. |
+| `list` | Prints the known IOCTLs with their required buffer sizes. |
 
 Unknown IOCTL codes can be sent too; the output is then shown as a raw hex dump and as dwords.
+
+The driver checks both buffer lengths for an **exact** match against its own descriptor table and fails any other size with `ERROR_INVALID_PARAMETER` before the request is handled. The tool therefore uses the required sizes by default, and prints a note when `-i` or `-o` sets a different size.
+
+The driver's `BytesReturned` value is not reliable (for example, `GET_INTERNAL_CALC` writes 12 bytes but reports 4). When a known IOCTL succeeds, the tool shows the whole output buffer instead of only the reported bytes.
 
 ### Examples
 
 ```
 wp81BmsTool percent
 wp81BmsTool 0x80180FA4
-wp81BmsTool SET_SYSTEM_INFO 0 25 0
-wp81BmsTool -o 16 calc
+wp81BmsTool calc
+wp81BmsTool SET_SYSTEM_INFO 51139 25000 893
 ```
 
 ### Sample output
@@ -41,30 +45,34 @@ Output   : 4 bytes buffer
 Result   : SUCCESS
 Returned : 4 bytes
 Output data:
-  0000: 4B 00 00 00                                      K...
+  0000: 34 03 00 00                                      4...
 As dwords:     hex    unsigned       signed
-  [ 0] 0x0000004B          75           75
-GET_PERCENT_CHARGE = 75 (0x0000004B)
+  [ 0] 0x00000334         820          820
+GET_PERCENT_CHARGE = 820 (0x00000334)
+Note: raw internal fuel-gauge SOC, in per-mille (82.0 %);
+      the phone's screen shows the OS-remapped display SOC, which differs
 ```
 
 ## Known IOCTLs
 
-All codes use device type `0x8018`, functions 1000-1008, `METHOD_BUFFERED` and `FILE_ANY_ACCESS`.
+All codes use device type `0x8018`, functions 1000-1008, `METHOD_BUFFERED` and `FILE_ANY_ACCESS`. The In and Out columns are the exact buffer sizes the driver requires.
 
-| Code | Name | Alias | Out bytes | Inputs | Notes |
-|---|---|---|---|---|---|
-| `0x80180FA0` | `GET_BATTERY_CHARGING_PROFILE` | `profile` | 4 | none | Backend unconfirmed; may just return the constant 4. |
-| `0x80180FA4` | `GET_BATTERY_CURRENT` | `current` | 4 | none | Calibrated battery current in mA (signed). |
-| `0x80180FA8` | `GET_BATTERY_VOLTAGE` | `voltage` | 4 | none | Divided VBAT at the ADC in mV, not the battery voltage itself. |
-| `0x80180FAC` | `GET_PERCENT_CHARGE` | `percent` | 4 | none | State of charge as computed by the driver. |
-| `0x80180FB0` | `SET_CHARGING_STATE` | `charging` | 4 | `<state>` | Forwards the charging state to the PMIC. |
-| `0x80180FB4` | `SET_SYSTEM_INFO` | `sysinfo` | 4 | `<timestamp> <temperature> <batteryId>` | The temperature feeds the SOC curves. |
-| `0x80180FB8` | `FORCE_OCV` | `ocv` | 4 | none | Reconfigures the BMS block (clear, wait 70 ms, configure). |
-| `0x80180FBC` | `SET_XOADC_CAL_VAL` | `xoadc` | 4 | `<rawPointA> <rawPointB>` | Two-point XOADC calibration codes. |
-| `0x80180FC0` | `GET_INTERNAL_CALC` | `calc` | 12 | none | Derated FCC, remaining-charge reference and headroom. |
+| Code | Name | Alias | In | Out | Inputs | Notes |
+|---|---|---|---|---|---|---|
+| `0x80180FA0` | `GET_BATTERY_CHARGING_PROFILE` | `profile` | 4 | 16 | ignored | **Misnamed.** Reconfigures the BMS hardware (clear, wait 70 ms, apply mode 11,2,2,6) and returns 0. It returns no charging-profile data. Do not poll it. |
+| `0x80180FA4` | `GET_BATTERY_CURRENT` | `current` | 0 | 4 | none | Calibrated battery current in mA, signed. Negative means discharging. |
+| `0x80180FA8` | `GET_BATTERY_VOLTAGE` | `voltage` | 0 | 4 | none | VBAT at the ADC pin in mV, before the board divider. Multiply by the divider (about 3x) to get the battery voltage, for example 1358 → about 4.07 V. |
+| `0x80180FAC` | `GET_PERCENT_CHARGE` | `percent` | 0 | 4 | none | Raw internal fuel-gauge state of charge in per-mille (820 = 82.0 %). The phone's screen shows a remapped display value, for example 91 % for a raw 82.0 %. |
+| `0x80180FB0` | `SET_CHARGING_STATE` | `charging` | 4 | 0 | `<state>` (0, 1 or 2) | Forwards the charging state to the PMIC. The buffer sizes are inferred, not read from the driver. |
+| `0x80180FB4` | `SET_SYSTEM_INFO` | `sysinfo` | 12 | 4 | `<timestamp> <temperature> <batteryId>` | Temperature in thousandths of °C (25000 = 25 °C); it feeds the SOC curves. `batteryId` is the battery ID-resistor ADC reading (about 893), not a serial number. |
+| `0x80180FB8` | `FORCE_OCV` | `ocv` | 0 | 0 | none | Does nothing in this driver build: it returns success without forcing an OCV measurement. |
+| `0x80180FBC` | `SET_XOADC_CAL_VAL` | `xoadc` | 8 | 0 | `<rawPointA> <rawPointB>` | Raw XOADC codes of the 0.625 V and 1.25 V reference voltages, used for the two-point ADC calibration. |
+| `0x80180FC0` | `GET_INTERNAL_CALC` | `calc` | 0 | 12 | none | Derated full-charge capacity, remaining-charge reference and remaining-charge headroom. |
 
 > [!WARNING]
-> The `SET_*` and `FORCE_OCV` requests change the state of the PMIC. Use them with care on a real device.
+> `GET_BATTERY_CHARGING_PROFILE` and the `SET_*` requests change the state of the driver or the PMIC. The tool prints a warning before sending them. Use them with care on a real device.
+>
+> The phone's battery stack (BATTC and NokiaEnergyDriver) sends these IOCTLs itself, so a value you set can be overwritten shortly afterwards.
 
 ## Exit codes
 
@@ -75,7 +83,7 @@ All codes use device type `0x8018`, functions 1000-1008, `METHOD_BUFFERED` and `
 | 2 | The device could not be opened. |
 | 3 | `DeviceIoControl` failed. |
 
-Common errors are printed with an explanation, for example `ERROR_FILE_NOT_FOUND` when the driver is not loaded, or `ERROR_INVALID_FUNCTION` when the driver rejects the IOCTL.
+Common errors are printed with an explanation, for example `ERROR_FILE_NOT_FOUND` when the driver is not loaded, `ERROR_INVALID_FUNCTION` when the driver rejects the IOCTL, or `ERROR_INVALID_PARAMETER` when a buffer size does not match the size the driver requires.
 
 ## Building
 

@@ -5,8 +5,9 @@
 //   <ioctl>   numeric code (0x80180FAC) or name (GET_PERCENT_CHARGE, percent, ...)
 //   input     32-bit values, decimal or 0x-hex, negative allowed
 // Options:
-//   -o <n>    output buffer size in bytes (default depends on the IOCTL)
-//   -i <n>    input buffer size in bytes (zero padded / truncated)
+//   -o <n>    output buffer size in bytes (default: the size the driver requires)
+//   -i <n>    input buffer size in bytes (default: the size the driver requires,
+//             missing input values are zero padded)
 //   -d <path> device path (default \\.\QCOMPMICBMS)
 //   list      print the known IOCTLs
 
@@ -43,33 +44,42 @@ struct IoctlInfo {
     DWORD Code;
     const char *Name;
     const char *Alias;
-    DWORD DefaultOutputSize;
+    DWORD InputSize;    // PmicBmsValidateIoctlParams requires exactly this many bytes
+    DWORD OutputSize;   // same, for the output buffer
     OutputKind Kind;
     const char *Inputs;
     const char *Notes;
+    const char *Warning; // printed before the call, NULL if the call is harmless
 };
 
 // IOCTL_BMS_* codes handled by PmicBmsIoctlDispatch (device type 0x8018,
-// functions 1000-1008, METHOD_BUFFERED, FILE_ANY_ACCESS).
+// functions 1000-1008, METHOD_BUFFERED, FILE_ANY_ACCESS). Buffer sizes come from
+// the driver's descriptor table (0x004191A8) and must match exactly, otherwise the
+// call fails with ERROR_INVALID_PARAMETER before the handler runs.
 static const IoctlInfo g_Ioctls[] = {
-    { 0x80180FA0, "GET_BATTERY_CHARGING_PROFILE", "profile", 4, OUT_ULONG,
-      "(none)", "backend unconfirmed, may just return the constant 4" },
-    { 0x80180FA4, "GET_BATTERY_CURRENT", "current", 4, OUT_LONG,
-      "(none)", "calibrated battery current, mA (signed)" },
-    { 0x80180FA8, "GET_BATTERY_VOLTAGE", "voltage", 4, OUT_ULONG,
-      "(none)", "divided VBAT at the ADC, mV (BMS output reg, selector 6: ((raw-0x6000)*1000>>10 + 5)/10)" },
-    { 0x80180FAC, "GET_PERCENT_CHARGE", "percent", 4, OUT_ULONG,
-      "(none)", "state of charge as computed by the driver" },
-    { 0x80180FB0, "SET_CHARGING_STATE", "charging", 4, OUT_RAW,
-      "<state>", "forwards the charging state to the PMIC" },
-    { 0x80180FB4, "SET_SYSTEM_INFO", "sysinfo", 4, OUT_LONG,
-      "<timestamp> <temperature> <batteryId>", "temperature feeds the SOC curves" },
-    { 0x80180FB8, "FORCE_OCV", "ocv", 4, OUT_ULONG,
-      "(none)", "reconfigures the BMS block (clear, 70 ms, configure)" },
-    { 0x80180FBC, "SET_XOADC_CAL_VAL", "xoadc", 4, OUT_RAW,
-      "<rawPointA> <rawPointB>", "two-point XOADC calibration codes" },
-    { 0x80180FC0, "GET_INTERNAL_CALC", "calc", 12, OUT_INTERNAL_CALC,
-      "(none)", "derated FCC, remaining-charge reference, headroom" },
+    { 0x80180FA0, "GET_BATTERY_CHARGING_PROFILE", "profile", 4, 16, OUT_ULONG,
+      "(ignored)", "misnomer: backend is PmicBmsReconfigure, returns 0 and no profile data",
+      "this reconfigures the BMS hardware (clear, 70 ms, apply mode 11,2,2,6); do not poll it" },
+    { 0x80180FA4, "GET_BATTERY_CURRENT", "current", 0, 4, OUT_LONG,
+      "(none)", "calibrated battery current, mA (signed, negative = discharging)", NULL },
+    { 0x80180FA8, "GET_BATTERY_VOLTAGE", "voltage", 0, 4, OUT_ULONG,
+      "(none)", "VBAT at the ADC pin (before the divider), mV; multiply by the board divider (~3x)", NULL },
+    { 0x80180FAC, "GET_PERCENT_CHARGE", "percent", 0, 4, OUT_ULONG,
+      "(none)", "raw internal fuel-gauge SOC, per-mille (the screen shows the OS-remapped display SOC)", NULL },
+    { 0x80180FB0, "SET_CHARGING_STATE", "charging", 4, 0, OUT_RAW,
+      "<state 0|1|2>", "forwards the charging state to the PMIC (sizes inferred, not dumped)",
+      "this changes the driver's charging state and SOC-correction timer" },
+    { 0x80180FB4, "SET_SYSTEM_INFO", "sysinfo", 12, 4, OUT_LONG,
+      "<timestamp> <temperature m-degC> <batteryId ADC>",
+      "temperature feeds the SOC curves; batteryId is the ID-resistor ADC reading (~893)",
+      "this overwrites the temperature used by the SOC curves and may re-provision the battery profile" },
+    { 0x80180FB8, "FORCE_OCV", "ocv", 0, 0, OUT_RAW,
+      "(none)", "no-op stub in this build: returns SUCCESS without forcing an OCV", NULL },
+    { 0x80180FBC, "SET_XOADC_CAL_VAL", "xoadc", 8, 0, OUT_RAW,
+      "<rawPointA> <rawPointB>", "raw XOADC codes of the 0.625 V and 1.25 V references",
+      "this overwrites the two-point ADC calibration used for OCV readings" },
+    { 0x80180FC0, "GET_INTERNAL_CALC", "calc", 0, 12, OUT_INTERNAL_CALC,
+      "(none)", "derated FCC, remaining-charge reference, headroom (BytesReturned says 4)", NULL },
 };
 
 #define IOCTL_COUNT (sizeof(g_Ioctls) / sizeof(g_Ioctls[0]))
@@ -115,23 +125,28 @@ static void PrintUsage()
     printf("       wp81BmsTool list\n\n");
     printf("  <ioctl>  code (e.g. 0x80180FAC) or name (e.g. GET_PERCENT_CHARGE or percent)\n");
     printf("  input    32-bit values, decimal or 0x-hex, negative allowed\n");
-    printf("  -o n     output buffer size in bytes (default depends on the IOCTL, 4 if unknown)\n");
-    printf("  -i n     input buffer size in bytes (zero padded or truncated)\n");
+    printf("  -o n     output buffer size in bytes (default: size required by the driver, 4 if unknown)\n");
+    printf("  -i n     input buffer size in bytes (default: size required by the driver,\n");
+    printf("           missing input values are zero padded)\n");
     printf("  -d path  device path (default \\\\.\\QCOMPMICBMS)\n\n");
     printf("Examples:\n");
     printf("  wp81BmsTool percent\n");
     printf("  wp81BmsTool 0x80180FA4\n");
-    printf("  wp81BmsTool SET_SYSTEM_INFO 0 25 0\n");
+    printf("  wp81BmsTool calc\n");
+    printf("  wp81BmsTool SET_SYSTEM_INFO 51139 25000 893\n");
 }
 
 static void PrintIoctlList()
 {
-    printf("%-10s %-30s %-9s %-4s %s\n", "Code", "Name", "Alias", "Out", "Inputs");
+    printf("%-10s %-30s %-9s %-3s %-3s %s\n", "Code", "Name", "Alias", "In", "Out", "Inputs");
     for (size_t i = 0; i < IOCTL_COUNT; i++) {
         const IoctlInfo *info = &g_Ioctls[i];
-        printf("0x%08lX %-30s %-9s %-4lu %s\n", info->Code, info->Name, info->Alias,
-               info->DefaultOutputSize, info->Inputs);
+        printf("0x%08lX %-30s %-9s %-3lu %-3lu %s\n", info->Code, info->Name, info->Alias,
+               info->InputSize, info->OutputSize, info->Inputs);
         printf("           %s\n", info->Notes);
+        if (info->Warning != NULL) {
+            printf("           Warning: %s\n", info->Warning);
+        }
     }
 }
 
@@ -141,7 +156,7 @@ static const char *Win32ErrorName(DWORD error)
     case ERROR_FILE_NOT_FOUND:        return "ERROR_FILE_NOT_FOUND (driver not loaded or wrong device path)";
     case ERROR_ACCESS_DENIED:         return "ERROR_ACCESS_DENIED (run with higher privileges)";
     case ERROR_INVALID_FUNCTION:      return "ERROR_INVALID_FUNCTION (STATUS_INVALID_DEVICE_REQUEST, IOCTL rejected)";
-    case ERROR_INVALID_PARAMETER:     return "ERROR_INVALID_PARAMETER";
+    case ERROR_INVALID_PARAMETER:     return "ERROR_INVALID_PARAMETER (usually a buffer size that does not match the driver's exactly)";
     case ERROR_GEN_FAILURE:           return "ERROR_GEN_FAILURE (STATUS_UNSUCCESSFUL)";
     case ERROR_INSUFFICIENT_BUFFER:   return "ERROR_INSUFFICIENT_BUFFER";
     case ERROR_MORE_DATA:             return "ERROR_MORE_DATA (STATUS_BUFFER_OVERFLOW)";
@@ -192,14 +207,27 @@ static void PrintDecoded(const IoctlInfo *info, const BYTE *data, DWORD length)
     case OUT_ULONG:
         if (length >= 4) {
             printf("%s = %lu (0x%08lX)\n", info->Name, v[0], v[0]);
+            if (info->Code == 0x80180FA0) {
+                printf("Note: status of PmicBmsReconfigure, not charging-profile data\n");
+            }
             if (info->Code == 0x80180FA8) {
-                printf("Note: divided VBAT at the ADC, in mV (not the battery voltage itself)\n");
+                printf("Note: VBAT at the ADC pin in mV, before the divider; with a ~3x divider\n"
+                       "      the battery voltage is about %lu mV (divider not confirmed)\n",
+                       v[0] * 3);
+            }
+            if (info->Code == 0x80180FAC) {
+                printf("Note: raw internal fuel-gauge SOC, in per-mille (%lu.%lu %%);\n"
+                       "      the phone's screen shows the OS-remapped display SOC, which differs\n",
+                       v[0] / 10, v[0] % 10);
             }
         }
         break;
     case OUT_LONG:
         if (length >= 4) {
             printf("%s = %ld (0x%08lX)\n", info->Name, (LONG)v[0], v[0]);
+            if (info->Code == 0x80180FA4) {
+                printf("Note: mA, %s\n", (LONG)v[0] < 0 ? "discharging" : "charging or idle");
+            }
         }
         break;
     case OUT_INTERNAL_CALC:
@@ -302,17 +330,32 @@ int main(int argc, char **argv)
         memcpy(inputBuffer + i * 4, &value, sizeof(value));
     }
 
-    DWORD inputLength = (inputSize >= 0) ? (DWORD)inputSize : inputDwordCount * 4;
+    // The driver checks both lengths for an exact match, so default to the required sizes.
+    DWORD inputLength;
+    if (inputSize >= 0) {
+        inputLength = (DWORD)inputSize;
+    } else if (info != NULL && inputDwordCount * 4 <= info->InputSize) {
+        inputLength = info->InputSize;
+    } else {
+        inputLength = inputDwordCount * 4;
+    }
     DWORD outputLength = (outputSize >= 0) ? (DWORD)outputSize
-                                           : (info != NULL ? info->DefaultOutputSize : 4);
+                                           : (info != NULL ? info->OutputSize : 4);
 
     printf("IOCTL    : 0x%08lX %s%s\n", ioctlCode, info != NULL ? "IOCTL_BMS_" : "",
            info != NULL ? info->Name : "(unknown)");
     printf("  DeviceType 0x%04lX, Function %lu, Method %lu, Access %lu\n",
            (ioctlCode >> 16) & 0xFFFF, (ioctlCode >> 2) & 0xFFF, ioctlCode & 3,
            (ioctlCode >> 14) & 3);
-    if (info != NULL && inputDwordCount == 0 && strcmp(info->Inputs, "(none)") != 0) {
-        printf("  Note: this IOCTL expects inputs %s\n", info->Inputs);
+    if (info != NULL && inputDwordCount * 4 < info->InputSize && strcmp(info->Inputs, "(ignored)") != 0) {
+        printf("  Note: this IOCTL expects inputs %s (missing values are sent as 0)\n", info->Inputs);
+    }
+    if (info != NULL && (inputLength != info->InputSize || outputLength != info->OutputSize)) {
+        printf("  Note: the driver requires exactly in=%lu/out=%lu bytes, this call will likely fail\n",
+               info->InputSize, info->OutputSize);
+    }
+    if (info != NULL && info->Warning != NULL) {
+        printf("  Warning: %s\n", info->Warning);
     }
     printf("Input    : %lu bytes\n", inputLength);
     if (inputLength > 0) {
@@ -351,7 +394,15 @@ int main(int argc, char **argv)
     printf("Returned : %lu bytes\n", bytesReturned);
 
     // Print whatever was returned, even on failure (ERROR_MORE_DATA still returns data).
+    // BytesReturned is not reliable for this driver (GET_INTERNAL_CALC writes 12 bytes
+    // but reports 4), so on success show the whole buffer the driver requires. The
+    // buffer is static, so bytes the driver did not write read as zero.
     DWORD shown = bytesReturned <= outputLength ? bytesReturned : outputLength;
+    if (ok && info != NULL && shown < outputLength) {
+        printf("Note: BytesReturned is unreliable for this driver, showing all %lu buffer bytes\n",
+               outputLength);
+        shown = outputLength;
+    }
     if (shown > 0) {
         printf("Output data:\n");
         PrintHexDump(outputBuffer, shown);
